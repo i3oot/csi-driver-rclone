@@ -598,8 +598,14 @@ func waitForVFSCacheSync(mc *mountContext) {
 		return
 	}
 
-	// Get VFS stats to check if cache is enabled
-	stats := mc.mountPoint.VFS.Stats()
+	// VFS.Stats can block behind a stuck VFS operation. Never let a diagnostic
+	// cache check hold the CSI volume-operation lock indefinitely: if stats do not
+	// return promptly, proceed to the bounded unmount path below.
+	stats, ok := vfsStatsWithTimeout(mc)
+	if !ok {
+		klog.Warningf("Timed out getting VFS stats for remote %s; proceeding with bounded unmount", mc.remoteName)
+		return
+	}
 
 	// Check if diskCache is present (only when cache mode > off)
 	_, hasDiskCache := stats["diskCache"].(rc.Params)
@@ -617,7 +623,11 @@ func waitForVFSCacheSync(mc *mountContext) {
 	for time.Now().Before(timeout) && retryCount < maxRetries {
 		allClear := true
 
-		stats := mc.mountPoint.VFS.Stats()
+		stats, ok := vfsStatsWithTimeout(mc)
+		if !ok {
+			klog.Warningf("Timed out getting VFS cache stats for remote %s; proceeding with bounded unmount", mc.remoteName)
+			return
+		}
 		if diskCache, ok := stats["diskCache"].(rc.Params); ok {
 			uploadsInProgress, _ := diskCache["uploadsInProgress"].(int)
 			uploadsQueued, _ := diskCache["uploadsQueued"].(int)
@@ -652,6 +662,23 @@ func waitForVFSCacheSync(mc *mountContext) {
 	}
 
 	klog.V(2).Infof("Cache sync complete, proceeding with unmount")
+}
+
+// vfsStatsWithTimeout isolates the best-effort cache check from a VFS.Stats
+// call that may block on internal VFS locks. The caller falls through to the
+// unmount path on timeout, which has its own graceful and forced time bounds.
+func vfsStatsWithTimeout(mc *mountContext) (rc.Params, bool) {
+	result := make(chan rc.Params, 1)
+	go func() {
+		result <- mc.mountPoint.VFS.Stats()
+	}()
+
+	select {
+	case stats := <-result:
+		return stats, true
+	case <-time.After(5 * time.Second):
+		return nil, false
+	}
 }
 
 // extractVFSOptions extracts and configures VFS (Virtual File System) options from parameters.
