@@ -2,6 +2,7 @@ name: Build and push Docker image to GHCR
 
 # Trigger on tags and releases for production builds
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -141,4 +142,3 @@ jobs:
               tag: ${{ github.ref_name }}
           \`\`\`
           EOF
-
