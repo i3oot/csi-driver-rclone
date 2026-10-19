@@ -58,7 +58,11 @@ func TestVendoredVFSIndependentMountLifecycleAndRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unpublishing first mount broke second: %v", err)
 	}
-	defer handle.Close()
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close surviving mount handle: %v", err)
+		}
+	}()
 	data, err := io.ReadAll(handle)
 	if err != nil || string(data) != "still-mounted" {
 		t.Fatalf("second mount read failed: %q %v", data, err)
