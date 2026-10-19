@@ -27,6 +27,12 @@ var Handler = defaultHandler()
 // This will be adjusted by InitLogging to be the configured levels
 // but it is important we have a logger running regardless of whether
 // InitLogging has been called yet or not.
+//
+// Note that this only sets rclone's private logger via fs.SetLogger
+// so that importing this package has no side effects on the
+// process-wide default slog logger. The CLI and other rclone-as-a-
+// program entry points pick up the default logger redirection in
+// InitLogging instead.
 func defaultHandler() *OutputHandler {
 	// Default options for default handler
 	opts := &slog.HandlerOptions{
@@ -36,11 +42,8 @@ func defaultHandler() *OutputHandler {
 	// Create our handler
 	h := NewOutputHandler(os.Stderr, opts, logFormatDate|logFormatTime)
 
-	// Set the slog default handler
-	slog.SetDefault(slog.New(h))
-
-	// Make log.Printf logs at level Notice
-	slog.SetLogLoggerLevel(fs.SlogLevelNotice)
+	// Set rclone's internal logger so rclone logging works
+	fs.SetLogger(h)
 
 	return h
 }
@@ -357,17 +360,19 @@ func (h *OutputHandler) Handle(ctx context.Context, r slog.Record) (err error) {
 		buf     *bytes.Buffer
 	)
 
-	// Read the format under the mutex once so it is consistent
-	// throughout this call. The mutex is released before calling
-	// jsonLog/textLog (which may re-acquire it) to avoid deadlock.
+	// Read the format and the extra outputs under the mutex once
+	// so they are consistent throughout this call. The mutex is
+	// released before calling jsonLog/textLog (which may re-acquire
+	// it) to avoid deadlock.
 	h.mu.Lock()
 	format := h.format
+	outputExtra := h.outputExtra
 	h.mu.Unlock()
 
 	// Check whether we need to build Text or JSON logs or both
 	needJSON := format&logFormatJSON != 0
 	needText := !needJSON
-	for _, out := range h.outputExtra {
+	for _, out := range outputExtra {
 		if out.json {
 			needJSON = true
 		} else {
@@ -410,7 +415,7 @@ func (h *OutputHandler) Handle(ctx context.Context, r slog.Record) (err error) {
 	}
 
 	// Log to any additional destinations required
-	for _, out := range h.outputExtra {
+	for _, out := range outputExtra {
 		if out.json {
 			out.output(r.Level, bufJSON.String())
 		} else {

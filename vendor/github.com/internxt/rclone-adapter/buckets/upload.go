@@ -106,6 +106,10 @@ func UploadFile(ctx context.Context, cfg *config.Config, filePath, targetFolderU
 	}
 	plainSize := fileInfo.Size()
 
+	if err := checkUploadSize(ctx, cfg, plainSize); err != nil {
+		return nil, err
+	}
+
 	// Setup encryption
 	encryptedReader, sha256Hasher, encIndex, err := encryptionSetup(f, cfg)
 	if err != nil {
@@ -119,9 +123,7 @@ func UploadFile(ctx context.Context, cfg *config.Config, filePath, targetFolderU
 	}
 
 	// Create Drive file metadata
-	base := filepath.Base(filePath)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	ext := strings.TrimPrefix(filepath.Ext(base), ".")
+	name, ext := SplitNameExt(filePath)
 	meta, err := CreateMetaFile(ctx, cfg, name, cfg.Bucket, &fileID, "03-aes", targetFolderUUID, name, ext, plainSize, modTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file metadata: %w", err)
@@ -133,6 +135,10 @@ func UploadFile(ctx context.Context, cfg *config.Config, filePath, targetFolderU
 // encrypting it on the fly and creating the metadata file in the target folder.
 // It returns the CreateMetaResponse of the created file entry.
 func UploadFileStream(ctx context.Context, cfg *config.Config, targetFolderUUID, fileName string, in io.Reader, plainSize int64, modTime time.Time) (*CreateMetaResponse, error) {
+	if err := checkUploadSize(ctx, cfg, plainSize); err != nil {
+		return nil, err
+	}
+
 	var ph [32]byte
 	if _, err := rand.Read(ph[:]); err != nil {
 		return nil, fmt.Errorf("cannot generate random index: %w", err)
@@ -218,9 +224,7 @@ func UploadFileStream(ctx context.Context, cfg *config.Config, targetFolderUUID,
 		return nil, fmt.Errorf("failed to finish upload: %w", err)
 	}
 
-	base := filepath.Base(fileName)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	ext := strings.TrimPrefix(filepath.Ext(base), ".")
+	name, ext := SplitNameExt(fileName)
 	meta, err := CreateMetaFile(ctx, cfg, name, cfg.Bucket, &finishResp.ID, "03-aes", targetFolderUUID, name, ext, plainSize, modTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file metadata: %w", err)
@@ -231,6 +235,10 @@ func UploadFileStream(ctx context.Context, cfg *config.Config, targetFolderUUID,
 // UploadFileStreamMultipart uploads data from an io.Reader using multipart upload.
 // This is intended for large files (>100MB) and splits the file into multiple chunks
 func UploadFileStreamMultipart(ctx context.Context, cfg *config.Config, targetFolderUUID, fileName string, in io.Reader, plainSize int64, modTime time.Time) (*CreateMetaResponse, error) {
+	if err := checkUploadSize(ctx, cfg, plainSize); err != nil {
+		return nil, err
+	}
+
 	state, err := newMultipartUploadState(cfg, plainSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize multipart upload state: %w", err)
@@ -246,9 +254,7 @@ func UploadFileStreamMultipart(ctx context.Context, cfg *config.Config, targetFo
 		return nil, fmt.Errorf("failed to finish multipart upload: %w", err)
 	}
 
-	base := filepath.Base(fileName)
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	ext := strings.TrimPrefix(filepath.Ext(base), ".")
+	name, ext := SplitNameExt(fileName)
 	meta, err := CreateMetaFile(ctx, cfg, name, cfg.Bucket, &finishResp.ID, "03-aes", targetFolderUUID, name, ext, plainSize, modTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file metadata: %w", err)
@@ -276,13 +282,14 @@ func UploadFileStreamAuto(ctx context.Context, cfg *config.Config, targetFolderU
 		}
 
 		plainSize = int64(len(bufferedData))
+		if err := checkUploadSize(ctx, cfg, plainSize); err != nil {
+			return nil, err
+		}
 		in = bytes.NewReader(bufferedData)
 	}
 
 	if plainSize == 0 {
-		base := filepath.Base(fileName)
-		name := strings.TrimSuffix(base, filepath.Ext(base))
-		ext := strings.TrimPrefix(filepath.Ext(base), ".")
+		name, ext := SplitNameExt(fileName)
 		meta, err := CreateMetaFile(ctx, cfg, name, cfg.Bucket, nil, "03-aes", targetFolderUUID, name, ext, 0, modTime)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create empty file metadata: %w", err)
@@ -293,6 +300,9 @@ func UploadFileStreamAuto(ctx context.Context, cfg *config.Config, targetFolderU
 	var capturedData *bytes.Buffer
 	var capturedReader io.Reader = in
 
+	// Sniffing for an image format is a different question from how the name
+	// is stored, so this deliberately reads a leading dot as an extension: a
+	// file called ".png" still gets a thumbnail.
 	ext := strings.TrimPrefix(filepath.Ext(fileName), ".")
 	if thumbnails.IsSupportedFormat(ext) && plainSize > 0 && plainSize <= config.MaxThumbnailSourceSize {
 		capturedData = &bytes.Buffer{}

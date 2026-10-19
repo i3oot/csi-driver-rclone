@@ -19,9 +19,9 @@ import (
 	"path"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -48,6 +48,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/rclone/rclone/lib/transferaccounter"
 	"golang.org/x/sync/errgroup"
 )
@@ -66,6 +67,7 @@ const (
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
 	sasCopyValidity       = time.Hour           // how long SAS should last when doing server side copy
+	sasCopyStartSkew      = 15 * time.Minute    // how far back SAS should start to allow for clock skew
 )
 
 // setAcceptEncodingGzip is a per-call policy that sets Accept-Encoding: gzip
@@ -236,6 +238,40 @@ avoid the time out.`,
 			Default:  maxListChunkSize,
 			Advanced: true,
 		}, {
+			Name: "use_arrow_list",
+			Help: `Use the Apache Arrow listing format.
+
+If set, directory listings are fetched using the ListBlobs Apache
+Arrow response format instead of XML. Arrow responses are smaller and
+much cheaper to parse, making listings of large containers several
+times faster. Combine with "list_parallelism" for the biggest gains.
+
+"Blob Listing with Apache Arrow" is in public preview at Microsoft and
+is only supported on flat namespace accounts. On accounts with a
+hierarchical namespace (ADLS Gen2), or where the feature is otherwise
+unavailable, the server returns XML and the listing transparently
+falls back to the normal XML path (logged at debug level).`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "list_parallelism",
+			Help: `Number of parallel shards to list a directory with.
+
+If set greater than 1, the blob name keyspace of each directory is
+split into ranges which are listed concurrently using the Arrow
+startFrom/endBefore range parameters. This can dramatically speed up
+listing containers with millions of objects, for both recursive
+(ListR) and single directory listings. Speed keeps improving up to a
+parallelism of around 30.
+
+This has no effect unless "use_arrow_list" is also set, as Arrow is the
+only listing path that supports server-side name ranges. If the
+account does not support range listing (e.g. it has a hierarchical
+namespace) the listing falls back to sequential. The default of 0 (or
+1) lists sequentially.`,
+			Default:  0,
+			Advanced: true,
+		}, {
 			Name: "access_tier",
 			Help: `Access tier of blob: hot, cool, cold or archive.
 
@@ -388,6 +424,8 @@ type Options struct {
 	UseCopyBlob          bool                 `config:"use_copy_blob"`
 	UploadConcurrency    int                  `config:"upload_concurrency"`
 	ListChunkSize        uint                 `config:"list_chunk"`
+	UseArrowList         bool                 `config:"use_arrow_list"`
+	ListParallelism      int                  `config:"list_parallelism"`
 	AccessTier           string               `config:"access_tier"`
 	ArchiveTierDelete    bool                 `config:"archive_tier_delete"`
 	DisableCheckSum      bool                 `config:"disable_checksum"`
@@ -409,6 +447,7 @@ type Fs struct {
 	features           *fs.Features                 // optional features
 	cntSVCcacheMu      sync.Mutex                   // mutex to protect cntSVCcache
 	cntSVCcache        map[string]*container.Client // reference to containerClient per container
+	arrowXMLFallback   atomic.Bool                  // set once the server answers XML so parallel listing is not retried
 	svc                *service.Client              // client to access azblob
 	cred               azcore.TokenCredential       // how to generate tokens (may be nil)
 	usingSharedKeyCred bool                         // set if using shared key credentials
@@ -607,6 +646,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.ListChunkSize > maxListChunkSize {
 		return nil, fmt.Errorf("blob list size can't be greater than %v - was %v", maxListChunkSize, opt.ListChunkSize)
+	}
+	if opt.ListParallelism > 1 && !opt.UseArrowList {
+		fs.Logf(nil, "azureblob: list_parallelism has no effect without use_arrow_list - listing sequentially")
 	}
 
 	if opt.AccessTier == "" {
@@ -1091,7 +1133,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 		delimiter = "/"
 	}
 
-	pager := f.cntSVC(containerName).NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
+	opts := &container.ListBlobsHierarchyOptions{
 		// Copy, Metadata, Snapshots, UncommittedBlobs, Deleted, Tags, Versions, LegalHold, ImmutabilityPolicy, DeletedWithVersions bool
 		Include: container.ListBlobsInclude{
 			Copy:             false,
@@ -1102,8 +1144,50 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 		},
 		Prefix:     &directory,
 		MaxResults: &maxResults,
-	})
-	foundItems := 0
+	}
+	// Request the Apache Arrow listing format. The SDK pager requests an
+	// Arrow IPC stream and decodes it, falling back to XML if the account
+	// doesn't have Arrow listing enabled. Skip the maxResults==1 probe
+	// (isEmpty) which doesn't benefit.
+	useArrow := f.opt.UseArrowList && maxResults != 1
+	if useArrow {
+		opts.ResponseFormat = container.StorageResponseFormatArrow
+	}
+
+	var foundItems int
+	var err error
+	if useArrow && f.opt.ListParallelism > 1 && !f.arrowXMLFallback.Load() {
+		// Arrow exposes server-side startFrom/endBefore name ranges, so the
+		// keyspace can be sharded and listed concurrently.
+		foundItems, err = f.listArrowParallel(ctx, containerName, directory, prefix, addContainer, opts, delimiter, fn)
+	} else {
+		foundItems, err = f.listBlobsPager(ctx, containerName, directory, prefix, addContainer, opts, delimiter, fn)
+	}
+	if err != nil {
+		return err
+	}
+	if f.opt.DirectoryMarkers && foundItems == 0 && directory != "" {
+		// Determine whether the directory exists or not by whether it has a marker
+		_, err := f.readMetaData(ctx, containerName, directory)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				return fs.ErrorDirNotFound
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// listBlobsPager runs the hierarchy listing described by opts, calling fn for
+// each blob and subdirectory, and returns the number of raw items seen.
+// delimiter selects flat (recurse) vs hierarchical listing. If opts requests
+// the Apache Arrow format and the service answers with XML (Arrow listing
+// not enabled) a debug message is logged.
+func (f *Fs) listBlobsPager(ctx context.Context, containerName, directory, prefix string, addContainer bool, opts *container.ListBlobsHierarchyOptions, delimiter string, fn listFn) (foundItems int, err error) {
+	useArrow := opts.ResponseFormat == container.StorageResponseFormatArrow
+	pager := f.cntSVC(containerName).NewListBlobsHierarchyPager(delimiter, opts)
+	checkedArrow := false
 	for pager.More() {
 		var response container.ListBlobsHierarchyResponse
 		err := f.pacer.Call(func() (bool, error) {
@@ -1113,12 +1197,22 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			return f.shouldRetry(ctx, err)
 		})
 
+		// If Arrow was requested but the service answered with XML, Arrow
+		// listing is not enabled on this account; the listing is still correct
+		// but not accelerated.
+		if useArrow && !checkedArrow && err == nil {
+			checkedArrow = true
+			if response.ContentType == nil || !strings.HasPrefix(*response.ContentType, arrowContentType) {
+				fs.Debugf(f, "Apache Arrow listing requested but server returned XML - Blob Listing with Apache Arrow may not be enabled on this account")
+			}
+		}
+
 		if err != nil {
 			// Check http error code along with service code, current SDK doesn't populate service code correctly sometimes
 			if storageErr, ok := err.(*azcore.ResponseError); ok && (storageErr.ErrorCode == string(bloberror.ContainerNotFound) || storageErr.StatusCode == http.StatusNotFound) {
-				return fs.ErrorDirNotFound
+				return foundItems, fs.ErrorDirNotFound
 			}
-			return err
+			return foundItems, err
 		}
 		// Advance marker to next
 		// marker = response.NextMarker
@@ -1138,7 +1232,12 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 				fs.Debugf(f, "Odd name received %q", remote)
 				continue
 			}
-			isDirectory := isDirectoryMarker(*file.Properties.ContentLength, file.Metadata, remote)
+			// ContentLength is documented as nullable in the Arrow listing schema
+			size := int64(-1)
+			if file.Properties.ContentLength != nil {
+				size = *file.Properties.ContentLength
+			}
+			isDirectory := isDirectoryMarker(size, file.Metadata, remote)
 			if isDirectory {
 				// Don't insert the root directory
 				if remote == f.opt.Enc.ToStandardPath(directory) {
@@ -1154,7 +1253,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			// Send object
 			err = fn(remote, file, isDirectory)
 			if err != nil {
-				return err
+				return foundItems, err
 			}
 		}
 		// Send the subdirectories
@@ -1169,6 +1268,13 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 				fs.Debugf(f, "Odd directory name received %q", remote)
 				continue
 			}
+			// Don't insert the root directory. The Arrow listing returns a
+			// directory marker blob with the same name as the listed directory
+			// as a BlobPrefix, whereas XML returns it as a blob (handled
+			// above).
+			if remote == f.opt.Enc.ToStandardPath(directory) {
+				continue
+			}
 			remote = remote[len(prefix):]
 			// Trim one slash off the remote name
 			remote, _ = strings.CutSuffix(remote, "/")
@@ -1181,21 +1287,11 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			// Send object
 			err = fn(remote, nil, true)
 			if err != nil {
-				return err
+				return foundItems, err
 			}
 		}
 	}
-	if f.opt.DirectoryMarkers && foundItems == 0 && directory != "" {
-		// Determine whether the directory exists or not by whether it has a marker
-		_, err := f.readMetaData(ctx, containerName, directory)
-		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				return fs.ErrorDirNotFound
-			}
-			return err
-		}
-	}
-	return nil
+	return foundItems, nil
 }
 
 // Convert a list item into a DirEntry
@@ -1661,7 +1757,7 @@ func (f *Fs) getUserDelegation(ctx context.Context) (*service.UserDelegationCred
 	}
 
 	// Validity window
-	start := time.Now().UTC()
+	start := time.Now().UTC().Add(-sasCopyStartSkew)
 	expiry := start.Add(2 * sasCopyValidity)
 	startStr := start.Format(time.RFC3339)
 	expiryStr := expiry.Format(time.RFC3339)
@@ -1710,7 +1806,7 @@ func (o *Object) getAuth(ctx context.Context, noAuth bool) (srcURL string, err e
 		// Build the SAS values
 		perms := sas.BlobPermissions{Read: true}
 		container, containerPath := o.split()
-		start := time.Now().UTC()
+		start := time.Now().UTC().Add(-sasCopyStartSkew)
 		expiry := start.Add(sasCopyValidity)
 		vals := sas.BlobSignatureValues{
 			StartTime:     start,
@@ -2180,12 +2276,31 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 	} else {
 		size = *info.ContentLength
 	}
+	// On a range request Content-Length is the length of the range, not the object, so take the
+	// object's size from the total in Content-Range instead.
+	if info.ContentRange != nil {
+		contentRange, err := rest.ParseContentRange(*info.ContentRange)
+		if err != nil {
+			fs.Debugf(o, "Failed to parse Content-Range %q: %v", *info.ContentRange, err)
+		} else if contentRange.Size >= 0 {
+			size = contentRange.Size
+		}
+	}
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
 	// NOTE - Client library always returns MD5 as base64 decoded string, Object needs to maintain
 	// this as base64 encoded string.
-	o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5)
+	//
+	// On a range request the service returns the whole-blob MD5 in the
+	// x-ms-blob-content-md5 header (BlobContentMD5) and leaves Content-MD5
+	// (ContentMD5) empty, so prefer BlobContentMD5. Never overwrite a known
+	// hash with an empty one, or a ranged read would drop the object's MD5.
+	if md5 := info.BlobContentMD5; len(md5) > 0 {
+		o.md5 = base64.StdEncoding.EncodeToString(md5)
+	} else if len(info.ContentMD5) > 0 {
+		o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5)
+	}
 	if info.ContentType == nil {
 		o.mimeType = ""
 	} else {
@@ -2204,22 +2319,6 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 	// 	o.accessTier = blob.AccessTier(*info.AccessTier)
 	// }
 	o.setMetadata(metadata)
-
-	// If it was a Range request, the size is wrong, so correct it
-	if info.ContentRange != nil {
-		contentRange := *info.ContentRange
-		slash := strings.IndexRune(contentRange, '/')
-		if slash >= 0 {
-			i, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
-			if err == nil {
-				o.size = i
-			} else {
-				fs.Debugf(o, "Failed to find parse integer from in %q: %v", contentRange, err)
-			}
-		} else {
-			fs.Debugf(o, "Failed to find length in %q", contentRange)
-		}
-	}
 	o.contentEncoding = info.ContentEncoding
 
 	// If decompressing then size and md5sum are unknown

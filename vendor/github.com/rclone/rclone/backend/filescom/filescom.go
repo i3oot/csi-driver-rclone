@@ -19,6 +19,7 @@ import (
 	"github.com/Files-com/files-sdk-go/v3/file"
 	file_migration "github.com/Files-com/files-sdk-go/v3/filemigration"
 	"github.com/Files-com/files-sdk-go/v3/folder"
+	files_sdk_lib "github.com/Files-com/files-sdk-go/v3/lib"
 	"github.com/Files-com/files-sdk-go/v3/session"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -174,6 +175,13 @@ func shouldRetry(ctx context.Context, err error) (bool, error) {
 			fs.Debugf(nil, "Retrying API error %v", err)
 			return true, err
 		}
+	}
+
+	// Errors from the upload storage servers are of this type
+	var httpErr files_sdk_lib.ResponseError
+	if errors.As(err, &httpErr) && slices.Contains(retryErrorCodes, httpErr.StatusCode) {
+		fs.Debugf(nil, "Retrying HTTP error %v", err)
+		return true, err
 	}
 
 	return fserrors.ShouldRetry(err), err
@@ -858,7 +866,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		file.UploadWithProvidedMtime(src.ModTime(ctx)),
 	}
 
-	err := o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.CallNoRetry(func() (bool, error) {
 		err := o.fs.fileClient.Upload(uploadOpts...)
 		return shouldRetry(ctx, err)
 	})
@@ -866,7 +874,24 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	return o.readMetaData(ctx)
+	// The server computes the MD5 asynchronously after upload so
+	// retry reading the metadata for a short time until it appears.
+	const maxTries = 10
+	for tries := 1; ; tries++ {
+		err = o.readMetaData(ctx)
+		if err != nil {
+			return err
+		}
+		if o.md5 != "" || tries >= maxTries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(tries) * 100 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 // Remove an object

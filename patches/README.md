@@ -311,3 +311,17 @@ For questions or issues with the patch system:
 2. Review existing patches for examples
 3. Open an issue in the project repository
 
+
+## rclone 1.75.2 upgrade (i3oot v0.5.2)
+
+The three patches are retained. The go-fuse guards were rebased onto go-fuse
+2.10.1, and the no-reuse patch onto rclone 1.75.2. The newer VFS Hold/shutdown
+logic remains intact; CSI publishes still create independent VFS instances.
+The duplicate-refresh patch applies without semantic changes.
+
+`TestVendoredVFSIndependentMountLifecycleAndRefresh` validates independent
+instances, refreshing both caches, and reading the surviving mount after the
+other shuts down. The pre-existing bounded CSI publish/unpublish fixes remain.
+The obsolete /tmp/go-bip39-fork replacement was removed after verifying its
+vendored production files match official go-bip39 v1.1.0 byte-for-byte.
+Mount options and cache policy are unchanged in this release.

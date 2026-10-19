@@ -1,6 +1,6 @@
---- vendor/github.com/rclone/rclone/vfs/vfs.go
+--- vendor/github.com/rclone/rclone/vfs/vfs.go.orig
 +++ vendor/github.com/rclone/rclone/vfs/vfs.go
-@@ -226,19 +226,15 @@
+@@ -229,20 +229,15 @@
  	// Fill out anything else
  	vfs.Opt.Init(ctx)
  
@@ -15,9 +15,10 @@
  	defer activeMu.Unlock()
  	configName := fs.ConfigString(f)
 -	for _, activeVFS := range active[configName] {
--		if vfs.Opt == activeVFS.Opt {
+-		// A VFS whose last reference has gone is being shut down
+-		// but may not have removed itself from the cache yet.
+-		if vfs.Opt == activeVFS.Opt && activeVFS.Hold() {
 -			fs.Debugf(f, "Reusing VFS from active cache")
--			activeVFS.inUse.Add(1)
 -			cancel()
 -			return activeVFS
 -		}

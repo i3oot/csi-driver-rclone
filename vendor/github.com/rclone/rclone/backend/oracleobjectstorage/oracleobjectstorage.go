@@ -4,12 +4,14 @@
 package oracleobjectstorage
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ncw/swift/v2"
@@ -76,16 +78,17 @@ var systemMetadataInfo = map[string]fs.MetadataHelp{
 
 // Fs represents a remote object storage server
 type Fs struct {
-	name          string                             // name of this remote
-	root          string                             // the path we are working on if any
-	opt           Options                            // parsed config options
-	ci            *fs.ConfigInfo                     // global config
-	features      *fs.Features                       // optional features
-	srv           *objectstorage.ObjectStorageClient // the connection to the object storage
-	rootBucket    string                             // bucket part of root (if any)
-	rootDirectory string                             // directory part of root (if any)
-	cache         *bucket.Cache                      // cache for bucket creation status
-	pacer         *fs.Pacer                          // To pace the API calls
+	name           string                             // name of this remote
+	root           string                             // the path we are working on if any
+	opt            Options                            // parsed config options
+	ci             *fs.ConfigInfo                     // global config
+	features       *fs.Features                       // optional features
+	srv            *objectstorage.ObjectStorageClient // the connection to the object storage
+	rootBucket     string                             // bucket part of root (if any)
+	rootDirectory  string                             // directory part of root (if any)
+	cache          *bucket.Cache                      // cache for bucket creation status
+	pacer          *fs.Pacer                          // To pace the API calls
+	warnCompressed sync.Once                          // warn once about compressed files
 }
 
 // NewFs Initialize backend
@@ -516,7 +519,11 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *objects
 				o.md5 = md5
 			}
 		}
-		o.bytes = *info.Size
+		if info.Size != nil {
+			o.bytes = *info.Size
+		} else {
+			fs.Debugf(o, "Failed to find object length")
+		}
 		o.storageTier = storageTierMap[strings.ToLower(string(info.StorageTier))]
 	} else {
 		err := o.readMetaData(ctx) // reads info and headers, returning an error
@@ -547,7 +554,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return f.Put(ctx, in, src, options...)
+	return f.Put(ctx, bufio.NewReader(in), src, options...)
 }
 
 // Mkdir creates the bucket if it doesn't exist

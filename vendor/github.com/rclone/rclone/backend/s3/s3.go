@@ -1356,28 +1356,29 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	}
 }
 
-func s3CheckRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	if s3RedirectCrossesHost(req, via) {
-		req.Header.Del("X-Amz-Security-Token")
-	}
-	return nil
+// s3RedirectSecretHeaders are the request headers carrying origin-bound
+// secrets that must not be forwarded when a redirect leaves the original
+// host. Go strips Authorization on a hostname change but keeps it for a
+// subdomain or a different port, and has no knowledge that the SSE-C
+// headers hold raw encryption keys, so we strip them all ourselves.
+var s3RedirectSecretHeaders = []string{
+	"X-Amz-Security-Token",  // AWS STS session token
+	"X-Amz-S3session-Token", // S3 Express (directory bucket) session token
+	"Authorization",         // e.g. IBM IAM bearer token
+	"ibm-service-instance-id",
+	"X-Amz-Server-Side-Encryption-Customer-Algorithm",
+	"X-Amz-Server-Side-Encryption-Customer-Key",
+	"X-Amz-Server-Side-Encryption-Customer-Key-Md5",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key",
+	"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-Md5",
+	"Referer", // may be a presigned request
 }
 
-func s3RedirectCrossesHost(req *http.Request, via []*http.Request) bool {
-	if len(via) == 0 {
-		return false
-	}
-	scheme, host := via[0].URL.Scheme, via[0].URL.Host
-	for _, redirect := range via[1:] {
-		if redirect.URL.Host != host || redirect.URL.Scheme != scheme {
-			return true
-		}
-	}
-	return host != req.URL.Host || scheme != req.URL.Scheme
-}
+// s3CheckRedirect is the http.Client CheckRedirect policy for S3. It
+// refuses HTTPS to HTTP downgrades and strips s3RedirectSecretHeaders
+// once a redirect has left the original host.
+var s3CheckRedirect = rest.StripHeadersOnCrossHostRedirectFn(s3RedirectSecretHeaders...)
 
 // Fixup the request if needed.
 //
@@ -1689,7 +1690,9 @@ func setEndpointValueForIDriveE2(m configmap.Mapper) (err error) {
 	if !ok || value == "" {
 		return
 	}
-	client := &http.Client{Timeout: time.Second * 3}
+	// Reuse the S3 redirect policy so this bootstrap call, which posts the
+	// access key ID, won't be redirected from HTTPS to plaintext HTTP.
+	client := &http.Client{Timeout: time.Second * 3, CheckRedirect: s3CheckRedirect}
 	// API to get user region endpoint against the Access Key details: https://www.idrive.com/e2/guides/get_region_endpoint
 	resp, err := client.Post("https://api.idrivee2.com/api/service/get_region_end_point",
 		"application/json",
@@ -2288,7 +2291,31 @@ func versionLess(a, b *types.ObjectVersion) bool {
 // types.ObjectVersion with Size = isDeleteMarker to tell them apart
 //
 // We then merge them back into the Versions in the correct order
-func mergeDeleteMarkers(oldVersions []types.ObjectVersion, deleteMarkers []types.DeleteMarkerEntry) (newVersions []types.ObjectVersion) {
+func mergeDeleteMarkers(oldVersions []types.ObjectVersion, deleteMarkers []types.DeleteMarkerEntry, urlEncoded bool) (newVersions []types.ObjectVersion) {
+	encodedKeys := make(map[string]string)
+	if urlEncoded {
+		// URL encoding can change key order, so compare decoded keys and restore the encoded keys for the caller.
+		oldVersions = append([]types.ObjectVersion(nil), oldVersions...)
+		deleteMarkers = append([]types.DeleteMarkerEntry(nil), deleteMarkers...)
+		decodeKey := func(key **string) {
+			if *key == nil {
+				return
+			}
+			encodedKey := **key
+			decodedKey, err := url.QueryUnescape(encodedKey)
+			if err != nil {
+				return
+			}
+			encodedKeys[decodedKey] = encodedKey
+			*key = &decodedKey
+		}
+		for i := range oldVersions {
+			decodeKey(&oldVersions[i].Key)
+		}
+		for i := range deleteMarkers {
+			decodeKey(&deleteMarkers[i].Key)
+		}
+	}
 	newVersions = make([]types.ObjectVersion, 0, len(oldVersions)+len(deleteMarkers))
 	for _, deleteMarker := range deleteMarkers {
 		var obj types.ObjectVersion
@@ -2303,6 +2330,11 @@ func mergeDeleteMarkers(oldVersions []types.ObjectVersion, deleteMarkers []types
 	}
 	// Merge any remaining versions
 	newVersions = append(newVersions, oldVersions...)
+	for i := range newVersions {
+		if encodedKey, ok := encodedKeys[deref(newVersions[i].Key)]; ok {
+			newVersions[i].Key = &encodedKey
+		}
+	}
 	return newVersions
 }
 
@@ -2342,7 +2374,7 @@ func (ls *versionsList) List(ctx context.Context) (resp *s3.ListObjectsV2Output,
 
 	// Merge in delete Markers as types.ObjectVersion if we need them
 	if ls.hidden || ls.usingVersionAt {
-		respVersions.Versions = mergeDeleteMarkers(respVersions.Versions, respVersions.DeleteMarkers)
+		respVersions.Versions = mergeDeleteMarkers(respVersions.Versions, respVersions.DeleteMarkers, ls.req.EncodingType == types.EncodingTypeUrl)
 	}
 
 	// Convert the Versions and the DeleteMarkers into an array of types.Object
@@ -2369,6 +2401,8 @@ func (ls *versionsList) List(ctx context.Context) (resp *s3.ListObjectsV2Output,
 		var obj types.Object
 		//structs.SetFrom(obj, objVersion)
 		setFrom_typesObject_typesObjectVersion(&obj, &objVersion)
+		// StorageClass has a different type in ObjectVersion so isn't copied by setFrom
+		obj.StorageClass = types.ObjectStorageClass(objVersion.StorageClass)
 		// Adjust the file names
 		if !ls.usingVersionAt && (!deref(objVersion.IsLatest) || objVersion.Size == isDeleteMarker) {
 			if obj.Key != nil && objVersion.LastModified != nil {
@@ -3247,6 +3281,16 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj, err := f.NewObject(ctx, remote)
 	if err != nil {
 		return nil, err
+	}
+
+	// With NoHeadObject no metadata was read for the new object, so carry
+	// the size and MD5 over from the source as a server-side copy produces
+	// an object with identical content.
+	if f.opt.NoHeadObject {
+		if dstObject, ok := dstObj.(*Object); ok {
+			dstObject.bytes = srcObj.bytes
+			dstObject.md5 = srcObj.md5
+		}
 	}
 
 	// Set Object Lock via separate API calls if requested
@@ -4627,6 +4671,16 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 			}
 			// retry all chunks once have done the first few
 			return true, err
+		}
+		if uout == nil || uout.ETag == nil {
+			// A successful UploadPart without an ETag header is unusable: the
+			// part ETag is required by CompleteMultipartUpload. Proxies and
+			// load balancers have been observed emitting empty 200 responses
+			// under load - see #9822. Treat it as a retryable error so the
+			// pacer retries this chunk, instead of dereferencing a nil ETag
+			// in the debug log below or completing the upload with a broken
+			// part list.
+			return true, fmt.Errorf("UploadPart response for chunk %d has no ETag", chunkNumber+1)
 		}
 		return false, nil
 	})
