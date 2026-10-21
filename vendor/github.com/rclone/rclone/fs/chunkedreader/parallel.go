@@ -101,6 +101,11 @@ func (s *stream) read(p []byte) (n int, err error) {
 		return n, nil
 	}
 	for {
+		// WaitWrite returns immediately after cancellation. Stop here instead
+		// of repeatedly reading an incomplete buffer in a busy loop.
+		if err := s.ctx.Err(); err != nil {
+			return n, err
+		}
 		var nn int
 		nn, err = s.rw.Read(p[n:])
 		fs.Debugf(s.cr.o, "%s: rw.Read nn=%d, err=%v", s.name, nn, err)

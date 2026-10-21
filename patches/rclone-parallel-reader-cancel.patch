@@ -1,0 +1,55 @@
+--- vendor/github.com/rclone/rclone/fs/chunkedreader/parallel.go.orig
++++ vendor/github.com/rclone/rclone/fs/chunkedreader/parallel.go
+@@ -101,6 +101,11 @@
+ 		return n, nil
+ 	}
+ 	for {
++		// WaitWrite returns immediately after cancellation. Stop here instead
++		// of repeatedly reading an incomplete buffer in a busy loop.
++		if err := s.ctx.Err(); err != nil {
++			return n, err
++		}
+ 		var nn int
+ 		nn, err = s.rw.Read(p[n:])
+ 		fs.Debugf(s.cr.o, "%s: rw.Read nn=%d, err=%v", s.name, nn, err)
+--- /dev/null
++++ vendor/github.com/rclone/rclone/fs/chunkedreader/parallel_cancel_test.go
+@@ -0,0 +1,38 @@
++package chunkedreader
++
++import (
++	"context"
++	"errors"
++	"github.com/rclone/rclone/lib/multipart"
++	"testing"
++	"time"
++)
++
++func TestStreamReadStopsOnCancellation(t *testing.T) {
++	for _, duringRead := range []bool{false, true} {
++		t.Run(map[bool]string{false: "already_cancelled", true: "cancel_while_waiting"}[duringRead], func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			rw := multipart.NewRW()
++			defer rw.Close()
++			s := &stream{cr: &parallel{}, ctx: ctx, rw: rw, size: 1024}
++			if !duringRead {
++				cancel()
++			}
++			done := make(chan error, 1)
++			go func() { _, err := s.read(make([]byte, 1024)); done <- err }()
++			if duringRead {
++				time.Sleep(10 * time.Millisecond)
++				cancel()
++			}
++			select {
++			case err := <-done:
++				if !errors.Is(err, context.Canceled) {
++					t.Fatalf("got %v, want cancellation", err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("cancelled stream is stuck in read loop")
++			}
++		})
++	}
++}

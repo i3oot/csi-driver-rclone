@@ -63,6 +63,7 @@ all: rclone
 .PHONY: unit-test
 unit-test:
 	go test -covermode=count -coverprofile=profile.cov ./pkg/... -v
+	go test github.com/rclone/rclone/fs/chunkedreader -run TestStreamReadStopsOnCancellation -timeout=30s
 
 .PHONY: local-build-push
 local-build-push: rclone

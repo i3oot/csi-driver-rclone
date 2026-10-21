@@ -325,3 +325,13 @@ other shuts down. The pre-existing bounded CSI publish/unpublish fixes remain.
 The obsolete /tmp/go-bip39-fork replacement was removed after verifying its
 vendored production files match official go-bip39 v1.1.0 byte-for-byte.
 Mount options and cache policy are unchanged in this release.
+
+## Parallel reader cancellation (i3oot v0.5.5)
+
+`rclone-parallel-reader-cancel.patch` stops `stream.read` when its context is
+cancelled. In rclone 1.75.2, `pool.RW.WaitWrite` returns immediately after
+cancellation, while the reader loops until the requested chunk is complete.
+An incomplete cancelled read therefore spins indefinitely. Live execution
+samples from worker-off4 on 2026-10-21 identified this exact stack consuming
+one CPU core. The regression covers cancellation before and during a read,
+and is run by `make unit-test`.
